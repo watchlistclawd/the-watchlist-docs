@@ -1,0 +1,1587 @@
+// ============================================================================
+// UNIVERSAL MEDIA DATABASE - DBML Schema (Annotated)
+// ============================================================================
+//
+// A flexible schema designed to catalog media across multiple formats:
+// movies, TV series, anime, manga, comics, novels, music albums, and video games.
+//
+// Architecture Philosophy:
+// - "entries" represent conceptual works (the artistic creation)
+// - "products" represent purchasable items (physical/digital goods)
+// - JSONB "details" fields store media-specific attributes to avoid sparse columns
+// - Lookup tables enforce controlled vocabularies and prevent data drift
+// - Junction tables enable many-to-many relationships with contextual metadata
+//
+// Table Count: 37
+//   User: 1 | Lookup: 10 | Core Entities: 6 | Products: 6 | Retailers: 2
+//   TV-Specific: 2 | Music-Specific: 3 | Entry Junctions: 7 | Product Junctions: 2
+//
+// See companion document "jsonb_templates.md" for per-medium JSONB examples.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// USER PROFILES
+// ----------------------------------------------------------------------------
+// Application-specific user data extending Supabase auth.users.
+// ----------------------------------------------------------------------------
+
+// User role hierarchy for authorization.
+Enum user_role {
+  USER
+  JANITOR
+  MODERATOR
+  ADMIN
+}
+
+// Extends Supabase auth.users with application-specific profile data.
+// One row per authenticated user, created automatically on signup.
+//
+// Example rows:
+//   id: (matches auth.users.id) | role: 'USER' | show_nsfw: false
+//   id: (matches auth.users.id) | role: 'ADMIN' | show_nsfw: true
+Table user_profiles {
+  // Primary key. Matches the UUID from Supabase auth.users.
+  // NOT auto-generated — set to auth.users.id on creation.
+  id uuid [pk]
+
+  // User's chosen display name. Nullable — falls back to email in UI when null.
+  display_name text
+
+  // Authorization role. Controls access to admin features.
+  // Values: 'USER', 'JANITOR', 'MODERATOR', 'ADMIN'
+  role user_role [not null, default: 'USER']
+
+  // Whether the user has opted in to viewing NSFW content.
+  show_nsfw boolean [not null, default: false]
+
+  // Whether the user prefers dark mode. Persisted as an account setting.
+  // false = light mode (default), true = dark mode.
+  dark_mode boolean [not null, default: false]
+
+  // User's preferred UI locale. FK to locales.code.
+  // Default: 'en'. Used to persist language preference across sessions.
+  locale_code varchar(10) [default: 'en', ref: > locales.code]
+
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+}
+
+// ----------------------------------------------------------------------------
+// LOOKUP TABLES
+// ----------------------------------------------------------------------------
+// Small, controlled vocabulary tables that enforce consistency across the database.
+// These are typically seeded once and modified infrequently.
+//
+// Pattern: `name` is the machine-readable key (used in code/URLs),
+// `display_name` is the human-readable label (used in UI).
+// ----------------------------------------------------------------------------
+
+// Controlled vocabulary for entry types.
+// Each media_type implies a different set of expected fields in entries.details.
+// The admin portal uses media_type to render the appropriate input form.
+//
+// Example rows:
+//   name: 'movie'          | display_name: 'Movie'
+//   name: 'anime_series'   | display_name: 'Anime Series'
+//   name: 'manga'          | display_name: 'Manga'
+//   name: 'music_album'    | display_name: 'Music Album'
+//   name: 'video_game'     | display_name: 'Video Game'
+Table media_types {
+  // Primary key. UUIDs used throughout for distributed-safe IDs.
+  id uuid [pk]
+
+  // Machine-readable identifier. Lowercase, snake_case, no spaces.
+  // Used in code, URLs, and API queries. Must be unique and stable.
+  // Example: 'anime_series', 'music_album', 'video_game'
+  name text [unique, not null]
+
+  // Human-readable label for UI display.
+  // Example: 'Anime Series', 'Music Album', 'Video Game'
+  display_name text [not null]
+
+  // Optional internal notes for admins explaining what this type covers.
+  // Example: 'Japanese animation released as a TV series (not films)'
+  description text
+
+  is_active boolean [default: true]
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+}
+
+// Roles that a creator (person) can have on an entry.
+// Covers all media types: film crew, musicians, authors, game developers, etc.
+//
+// Example rows:
+//   name: 'director'       | display_name: 'Director'        | category: 'film'
+//   name: 'voice_actor'    | display_name: 'Voice Actor'     | category: 'voice'
+//   name: 'mangaka'        | display_name: 'Mangaka'         | category: 'literary'
+//   name: 'composer'       | display_name: 'Composer'        | category: 'music'
+//   name: 'game_director'  | display_name: 'Game Director'   | category: 'game'
+Table creator_roles {
+  id uuid [pk]
+
+  // Machine-readable role identifier. Lowercase, snake_case.
+  // Example: 'voice_actor', 'mangaka', 'lead_guitarist'
+  name text [unique, not null]
+
+  // Human-readable label.
+  // Example: 'Voice Actor', 'Mangaka', 'Lead Guitarist'
+  display_name text [not null]
+
+  // Groups related roles for filtering and UI organization.
+  // Helps narrow role dropdowns based on media type being edited.
+  // Values: 'film', 'television', 'music', 'literary', 'game', 'voice'
+  // Example: 'music' for vocalist, guitarist, drummer
+  category text
+
+  // Optional internal notes explaining the role's scope or usage.
+  // Example: 'Primary artist responsible for both story and artwork in manga'
+  description text
+
+  is_active boolean [default: true]
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+}
+
+// Roles that a company (organization) can have on an entry or product.
+// Companies often have multiple roles on the same entry (e.g., studio AND distributor).
+//
+// Example rows:
+//   name: 'studio'        | display_name: 'Studio'
+//   name: 'publisher'     | display_name: 'Publisher'
+//   name: 'distributor'   | display_name: 'Distributor'
+//   name: 'manufacturer'  | display_name: 'Manufacturer'
+//   name: 'label'         | display_name: 'Record Label'
+//   name: 'licensor'      | display_name: 'Licensor'
+Table company_roles {
+  id uuid [pk]
+
+  // Machine-readable role identifier.
+  // Example: 'studio', 'publisher', 'manufacturer', 'licensor'
+  name text [unique, not null]
+
+  // Human-readable label.
+  // Example: 'Studio', 'Publisher', 'Manufacturer'
+  display_name text [not null]
+
+  // Optional internal notes.
+  // Example: 'Use for companies that funded/produced the work, not distributors'
+  description text
+
+  is_active boolean [default: true]
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+}
+
+// Broad categorization for entries. Hierarchical via parent_id.
+// Can be universal (applies to all media) or media-specific.
+//
+// Universal genres: 'action', 'comedy', 'drama', 'horror', 'romance'
+// Media-specific:
+//   Anime/Manga: 'shounen', 'shoujo', 'seinen', 'josei', 'isekai', 'mecha'
+//   Music: 'rock', 'progressive_rock', 'jazz', 'j_pop'
+//   Games: 'rpg', 'fps', 'platformer', 'roguelike', 'visual_novel'
+//
+// Hierarchy example: 'progressive_rock' -> parent: 'rock'
+Table genres {
+  id uuid [pk]
+
+  // Machine-readable genre identifier. Lowercase, snake_case.
+  // Example: 'shounen', 'progressive_rock', 'roguelike'
+  name text [not null]
+
+  // Human-readable label.
+  // Example: 'Shounen', 'Progressive Rock', 'Roguelike'
+  display_name text [not null]
+
+  // Self-referential FK for sub-genre hierarchies. NULL for top-level genres.
+  // Example: 'progressive_rock' (child) -> 'rock' (parent)
+  parent_id uuid [ref: > genres.id]
+
+  // Scope restriction. NULL means genre applies to all media types.
+  // Set to a specific media_type_id to restrict (e.g., 'shounen' only for manga/anime).
+  // Prevents admins from tagging a movie as 'shounen'.
+  media_type_id uuid [ref: > media_types.id]
+
+  // Optional description of the genre.
+  // Example: 'Japanese demographic category targeting young males, ages 12-18'
+  description text
+
+  is_active boolean [default: true]
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+
+  indexes {
+    // Same genre name can exist for different media types.
+    // Example: 'romance' (universal, NULL) and 'romance' (games, visual novel subgenre)
+    (name, media_type_id) [unique]
+  }
+}
+
+// Defines directional relationships between entries.
+// Used to link sequels, prequels, adaptations, remakes, spin-offs, etc.
+//
+// Example rows:
+//   name: 'sequel'      | inverse_name: 'prequel'          | is_directional: true
+//   name: 'adaptation'  | inverse_name: 'source_material'  | is_directional: true
+//   name: 'remake'      | inverse_name: 'original'         | is_directional: true
+//   name: 'related'     | inverse_name: 'related'          | is_directional: false
+Table relationship_types {
+  id uuid [pk]
+
+  // Machine-readable relationship identifier (forward direction).
+  // Example: 'sequel' (A is sequel to B)
+  name text [unique, not null]
+
+  // Human-readable label for forward direction.
+  // Example: 'Sequel'
+  display_name text [not null]
+
+  // Machine-readable label for reverse direction.
+  // Example: 'prequel' (B is prequel to A)
+  inverse_name text
+
+  // Human-readable label for reverse direction.
+  // Example: 'Prequel'
+  inverse_display_name text
+
+  // Whether the relationship has a meaningful direction.
+  // TRUE: sequel/prequel have distinct meanings
+  // FALSE: 'related' is symmetric (A related to B = B related to A)
+  is_directional boolean [default: true]
+
+  // Optional notes on when to use this relationship.
+  // Example: 'Use adaptation when one medium is based on another (manga->anime)'
+  description text
+
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+}
+
+// Flexible, user-driven labels for themes, moods, content warnings, and tropes.
+// More granular than genres. Expected to grow organically over time.
+// Tags enable discovery: "show me all entries tagged 'time_travel' + 'romance'".
+//
+// Example rows by category:
+//   theme:           'time_travel', 'revenge', 'found_family', 'coming_of_age'
+//   mood:            'dark', 'cozy', 'uplifting', 'melancholic'
+//   setting:         'cyberpunk', 'space', 'medieval', 'school'
+//   content_warning: 'graphic_violence', 'sexual_content', 'suicide_themes'
+//   trope:           'tsundere', 'love_triangle', 'chosen_one', 'isekai'
+Table tags {
+  id uuid [pk]
+
+  // Machine-readable tag identifier. Lowercase, snake_case.
+  // Example: 'time_travel', 'graphic_violence', 'cozy'
+  name text [unique, not null]
+
+  // Human-readable label.
+  // Example: 'Time Travel', 'Graphic Violence', 'Cozy'
+  display_name text [not null]
+
+  // Groups tags for organization and filtering in admin UI.
+  // Values: 'theme', 'mood', 'setting', 'content_warning', 'trope', 'feature'
+  category text
+
+  // Optional explanation of what the tag means.
+  // Example: 'Apply when the story involves traveling backwards or forwards in time'
+  description text
+
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+}
+
+// Supported languages/locales for translation tables.
+// Used by entry_translations, product_translations, etc.
+//
+// Example rows:
+//   code: 'en' | name: 'English'  | native_name: 'English'
+//   code: 'ja' | name: 'Japanese' | native_name: '日本語'
+//   code: 'ko' | name: 'Korean'   | native_name: '한국어'
+Table locales {
+  // Primary key. ISO 639-1 two-letter code (or BCP 47 for regional variants).
+  // Example: 'en', 'ja', 'ko', 'zh-TW', 'pt-BR'
+  code varchar(10) [pk]
+
+  // English name of the language. Used in admin UIs.
+  // Example: 'English', 'Japanese', 'Korean'
+  name text [not null]
+
+  // Name of the language in its own script. Used in language pickers.
+  // Example: '日本語', '한국어'
+  native_name text
+
+  is_active boolean [default: true]
+  created_at timestamptz [default: `now()`]
+}
+
+// ISO 3166-1 alpha-2 country codes.
+// Used for: creator nationality, company headquarters, product region.
+//
+// Example rows:
+//   code: 'US' | name: 'United States'
+//   code: 'JP' | name: 'Japan'
+//   code: 'KR' | name: 'South Korea'
+Table countries {
+  // Primary key. ISO 3166-1 alpha-2 code.
+  // Example: 'US', 'JP', 'KR', 'GB'
+  code varchar(2) [pk]
+
+  // English name of the country.
+  // Example: 'United States', 'Japan', 'South Korea'
+  name text [not null]
+
+  is_active boolean [default: true]
+  created_at timestamptz [default: `now()`]
+}
+
+// Top-level product categories.
+// Determines which subcategories are available and what details fields are expected.
+//
+// Example rows:
+//   name: 'figure'        | display_name: 'Figure'
+//   name: 'home_video'    | display_name: 'Home Video'
+//   name: 'music_physical'| display_name: 'Physical Music'
+//   name: 'book'          | display_name: 'Book'
+//   name: 'apparel'       | display_name: 'Apparel'
+Table product_categories {
+  id uuid [pk]
+
+  // Machine-readable category identifier.
+  // Example: 'figure', 'home_video', 'music_physical', 'book'
+  name text [unique, not null]
+
+  // Human-readable label.
+  // Example: 'Figure', 'Home Video', 'Physical Music'
+  display_name text [not null]
+
+  // Optional notes.
+  // Example: 'Physical music releases including vinyl, CD, and cassette'
+  description text
+
+  is_active boolean [default: true]
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+}
+
+// Subcategories within a product category.
+// Enables more granular filtering within a category.
+//
+// Example rows under 'figure' category:
+//   name: 'scale_figure'    | display_name: 'Scale Figure'
+//   name: 'nendoroid'       | display_name: 'Nendoroid'
+//   name: 'figma'           | display_name: 'Figma'
+//   name: 'prize_figure'    | display_name: 'Prize Figure'
+//   name: 'pop_up_parade'   | display_name: 'Pop Up Parade'
+//
+// Example rows under 'home_video' category:
+//   name: 'bluray'          | display_name: 'Blu-ray'
+//   name: 'dvd'             | display_name: 'DVD'
+//   name: 'uhd_4k'          | display_name: '4K UHD'
+//   name: 'steelbook'       | display_name: 'Steelbook'
+Table product_subcategories {
+  id uuid [pk]
+
+  // Machine-readable subcategory identifier.
+  // Must be unique within its parent category (see index).
+  // Example: 'scale_figure', 'nendoroid', 'steelbook'
+  name text [not null]
+
+  // Human-readable label.
+  // Example: 'Scale Figure', 'Nendoroid', 'Steelbook'
+  display_name text [not null]
+
+  // Parent category FK. Required.
+  // Example: 'nendoroid' belongs to 'figure' category
+  category_id uuid [not null, ref: > product_categories.id]
+
+  // Optional notes.
+  // Example: 'Chibi-style figures with interchangeable faces and accessories'
+  description text
+
+  is_active boolean [default: true]
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+
+  indexes {
+    // Subcategory names must be unique within their category.
+    // 'limited_edition' can exist under both 'home_video' and 'figure'.
+    (category_id, name) [unique]
+  }
+}
+
+// ----------------------------------------------------------------------------
+// CORE ENTITIES
+// ----------------------------------------------------------------------------
+// The primary tables representing media works, people, organizations,
+// franchises, and characters. These are the "nouns" of the system.
+// ----------------------------------------------------------------------------
+
+// The central table. Every piece of media (the artistic work, not the product)
+// gets one row here. This is the "conceptual" level.
+//
+// Examples of what becomes an entry:
+//   - "My Dress-Up Darling" (anime_series) - the show itself
+//   - "My Dress-Up Darling" (manga) - the manga series
+//   - "Moving Pictures" (music_album) - Rush's 1981 album
+//   - "Elden Ring" (video_game) - the game
+//
+// What does NOT go here (goes in products instead):
+//   - The Japanese Blu-ray release of the anime
+//   - The Target-exclusive vinyl pressing
+//   - A specific figure of a character
+Table entries {
+  id uuid [pk]
+
+
+
+
+
+
+  // Discriminator field. Determines which details fields are expected
+  // and how the entry is categorized/displayed.
+  // FK to media_types.id.
+  media_type_id uuid [not null, ref: > media_types.id]
+
+  // The primary display title. Usually the English or localized title
+  // appropriate for your primary audience.
+  // Example: 'My Dress-Up Darling', 'Moving Pictures', 'Elden Ring'
+  title text [not null]
+
+  // Title formatted for alphabetical sorting.
+  // Move leading articles to the end: "The Godfather" -> "Godfather, The"
+  // NULL if same as title.
+  // Example: 'Dress-Up Darling, My', 'Legend of Zelda, The'
+  sort_title text
+
+  // Array of alternative titles for search and display.
+  // Includes: original language title, romanizations, abbreviations, former titles.
+  // Example: ['その着せ替え人形は恋をする', 'Sono Bisque Doll wa Koi wo Suru', 'KisekOi']
+  alternate_titles text[]
+
+  // Initial public release date.
+  // TV series: first episode air date
+  // Movies: theatrical release
+  // Albums: original release date
+  // Example: '2022-01-09'
+  release_date date
+
+  // Production/release status. Controlled vocabulary.
+  // Values: 'announced', 'in_production', 'released', 'cancelled', 'hiatus'
+  // Example: 'released' for completed series, 'in_production' for airing anime
+  status text [default: 'released']
+
+  // Brief description, 1-3 paragraphs. Spoiler-free summary.
+  // Used for cards, previews, and search results.
+  description text
+
+  // Whether the entry contains adult/NSFW content.
+  // Used for site-wide filtering alongside products.nsfw.
+  // Example: TRUE for explicit content, FALSE for general audiences
+  nsfw boolean [default: false]
+
+  // ISO 639-1 language code for the original/primary language.
+  // FK to locales.code.
+  // Example: 'ja' for anime/manga, 'en' for Hollywood films
+  locale_code varchar(10) [not null, ref: > locales.code]
+
+  // URL or storage path to the primary poster/cover image.
+  // Example: 'https://image.tmdb.org/t/p/original/abc.jpg' or '/storage/entries/123/poster.jpg'
+  primary_image text
+
+  // Wikidata entity ID. Universal cross-reference for data enrichment.
+  // Format: 'Q' followed by digits.
+  // Example: 'Q106224474' for My Dress-Up Darling
+  wikidata_id text
+
+  // Flexible JSONB bucket for media-specific attributes and external IDs.
+  // See jsonb_templates.md for per-media_type structure.
+  //
+  // Common external IDs: imdb_id, tmdb_id, tvdb_id, mal_id, anilist_id, musicbrainz_id, igdb_id
+  // Media-specific: runtime_minutes, episode_count, volume_count, budget, tagline, etc.
+  details jsonb [default: '{}']
+
+  is_active boolean [default: true]
+
+  // URL-safe unique identifier. Lowercase, hyphens, no special characters.
+  // Used in URLs: /entries/{slug}
+  // Example: 'my-dress-up-darling', 'moving-pictures-rush'
+  slug text [unique, not null]
+
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+}
+
+// Human-curated official translations of entry titles.
+// Used when the localized title differs significantly from a direct translation.
+// NOT for fan translations or romanizations (those go in alternate_titles[]).
+//
+// Example:
+//   Entry: 'My Dress-Up Darling' (primary title)
+//   Translation (ja): 'その着せ替え人形は恋をする' (official Japanese title)
+Table entry_translations {
+  id uuid [pk]
+
+  // The entry this translation belongs to.
+  entry_id uuid [not null, ref: > entries.id]
+
+  // The language/locale of this translation. FK to locales.code.
+  // Example: 'ja', 'en', 'ko'
+  locale_code varchar(10) [not null, ref: > locales.code]
+
+  // The official localized title in this language.
+  // Must be an official/licensed translation, not fan-made.
+  // Example: 'その着せ替え人形は恋をする'
+  translated_title text [not null]
+
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+
+  indexes {
+    // One translation per entry per locale.
+    (entry_id, locale_code) [unique]
+  }
+}
+
+// People who create media: directors, writers, musicians, voice actors, authors, etc.
+// One row per real person, regardless of how many works they've contributed to.
+//
+// Examples:
+//   'Hayao Miyazaki' - director, screenwriter (Ghibli films)
+//   'Hina Suguta' - voice actor (Marin in My Dress-Up Darling)
+//   'Geddy Lee' - vocalist, bassist (Rush)
+Table creators {
+  id uuid [pk]
+
+
+
+
+
+  // Primary display name. Use the most commonly recognized form.
+  // Example: 'Hayao Miyazaki', 'Geddy Lee', 'Hina Suguta'
+  full_name text [not null]
+
+  // Name formatted for alphabetical sorting.
+  // Example: 'Miyazaki, Hayao', 'Lee, Geddy'
+  sort_name text
+
+  // Name in original script when different from full_name.
+  // Example: '宮崎 駿' for Miyazaki, '福田 晋一' for Shinichi Fukuda
+  native_name text
+
+  // Clarifying text to distinguish people with identical names.
+  // Follows Wikipedia's disambiguation pattern.
+  // Example: 'American film composer, born 1932' (vs other John Williams)
+  disambiguation text
+
+  // Date of birth. NULL if unknown.
+  // Example: '1941-01-05' for Hayao Miyazaki
+  birth_date date
+
+  // Date of death. NULL if still living or unknown.
+  death_date date
+
+  // City, region, or country of birth. Free text.
+  // Example: 'Tokyo, Japan', 'Los Angeles, California, USA'
+  birth_place text
+
+  // Primary nationality. FK to countries.code.
+  // Example: 'JP' for Japanese, 'US' for American
+  nationality varchar(2) [ref: > countries.code]
+
+  // Extended biographical text. Can be multiple paragraphs.
+  biography text
+
+  // URL or path to headshot/profile image.
+  primary_image text
+
+  // Wikidata entity ID for this person.
+  // Example: 'Q55043' for Hayao Miyazaki
+  wikidata_id text
+
+  // JSONB object containing website and social media URLs.
+  // Example: {"website": "https://...", "twitter": "https://twitter.com/..."}
+  websites jsonb [default: '{}']
+
+  // JSONB bucket for external IDs and supplementary data.
+  // Example: {"imdb_id": "nm0594503", "mal_id": 1870}
+  details jsonb [default: '{}']
+
+  is_active boolean [default: true]
+
+  // URL-safe unique identifier. Used in URLs: /creators/{slug}
+  // Example: 'hayao-miyazaki', 'hina-suguta', 'geddy-lee'
+  slug text [unique, not null]
+
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+}
+
+// Organizations: studios, publishers, record labels, game developers, distributors.
+// One row per company, regardless of how many roles they play across entries.
+//
+// Examples:
+//   'CloverWorks' - anime studio
+//   'Shueisha' - manga publisher
+//   'Good Smile Company' - figure manufacturer
+//   'FromSoftware' - game developer
+Table companies {
+  id uuid [pk]
+
+
+
+
+
+  // Primary display name. Use the official English name or most recognized form.
+  // Example: 'CloverWorks', 'Shueisha', 'Good Smile Company'
+  name text [not null]
+
+  // Name in original script when relevant.
+  // Example: '集英社' for Shueisha, 'クローバーワークス' for CloverWorks
+  native_name text
+
+  // Informational label for the company's primary business.
+  // NOTE: Actual role on any given entry/product is in junction tables.
+  // Values: 'studio', 'publisher', 'label', 'developer', 'manufacturer'
+  // Example: 'studio' for CloverWorks
+  primary_type text
+
+  // Year the company was founded. NULL if unknown.
+  // Example: 2018 for CloverWorks
+  founded_year integer
+
+  // Year the company ceased operations. NULL if still active.
+  defunct_year integer
+
+  // Country where HQ is located. FK to countries.code.
+  // Example: 'JP' for Japanese companies
+  headquarters_country varchar(2) [ref: > countries.code]
+
+  // Brief description of the company.
+  company_summary text
+
+  // URL or path to company logo.
+  primary_image text
+
+  // Self-referential FK for parent companies / corporate hierarchy.
+  // Example: 'Sony Music Labels' -> 'Sony Music Entertainment' -> 'Sony Corporation'
+  parent_company_id uuid [ref: > companies.id]
+
+  // Wikidata entity ID.
+  // Example: 'Q5765795' for CloverWorks
+  wikidata_id text
+
+  // JSONB object with website and social media URLs.
+  // Example: {"website": "https://...", "twitter": "https://..."}
+  websites jsonb [default: '{}']
+
+  is_active boolean [default: true]
+
+  // URL-safe unique identifier. Used in URLs: /companies/{slug}
+  // Example: 'cloverworks', 'good-smile-company', 'shueisha'
+  slug text [unique, not null]
+
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+}
+
+// Intellectual Properties: franchises, brands, series umbrellas, artist catalogs.
+// Hierarchical grouping for related entries across media types.
+//
+// Examples:
+//   'My Dress-Up Darling' - groups manga + anime + any future adaptations
+//   'Marvel Cinematic Universe' - groups all MCU films, shows
+//   'Rush' - groups all albums by the band Rush
+//
+// Hierarchy example:
+//   'Guardians of the Galaxy' -> parent: 'Marvel Cinematic Universe' -> parent: 'Marvel'
+Table franchises {
+  id uuid [pk]
+
+
+
+
+
+  // Name of the franchise/brand/IP.
+  // Example: 'My Dress-Up Darling', 'Marvel Cinematic Universe'
+  name text [not null]
+
+  native_name text
+
+  alternate_names text[]
+
+  // Self-referential FK for Franchise hierarchies. NULL for top-level Franchises.
+  // Example: 'Guardians of the Galaxy' -> 'Marvel Cinematic Universe'
+  parent_id uuid [ref: > franchises.id]
+
+  // Description of the Franchise, its history, scope, etc.
+  description text
+
+  // URL or path to franchise logo/key art.
+  primary_image text
+
+  // Wikidata entity ID for the franchise.
+  wikidata_id text
+
+  // JSONB with official websites, social media.
+  // Example: {"website": "https://...", "twitter": "https://..."}
+  websites jsonb [default: '{}']
+
+  // URL-safe unique identifier. Used in URLs: /franchises/{slug}
+  // Example: 'my-dress-up-darling', 'marvel-cinematic-universe'
+  slug text [unique, not null]
+
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+}
+
+// Fictional characters that appear in entries and/or on products.
+// One row per character (across all their appearances).
+// Critical for figure/merch search: "show me all Marin Kitagawa figures".
+//
+// Examples:
+//   'Marin Kitagawa' from My Dress-Up Darling
+//   'Spike Spiegel' from Cowboy Bebop
+//   'Link' from The Legend of Zelda
+Table characters {
+  id uuid [pk]
+
+
+
+
+
+  // Primary display name. Usually the localized/English name.
+  // Example: 'Marin Kitagawa', 'Spike Spiegel'
+  name text [not null]
+
+  // For alphabetical sorting.
+  // Example: 'Kitagawa, Marin'
+  sort_name text
+
+  // Name in original script.
+  // Example: '喜多川 海夢' for Marin
+  native_name text
+
+  // Array of alternate names: nicknames, full names, aliases, romanizations.
+  // Example: ['Marin', 'Kitagawa Marin', 'マリン']
+  alternate_names text[]
+
+  // Character description/bio. Avoid major spoilers.
+  description text
+
+  // URL or path to character portrait.
+  primary_image text
+
+  // The Franchise this character originates from. Required.
+  // Characters belong to one Franchise but can appear in multiple entries.
+  // FK to franchises.id.
+  franchise_id uuid [not null, ref: > franchises.id]
+
+  // Wikidata entity ID for the character.
+  wikidata_id text
+
+  is_active boolean [default: true]
+
+  // URL-safe unique identifier. Used in URLs: /characters/{slug}
+  // Example: 'marin-kitagawa', 'spike-spiegel'
+  slug text [unique, not null]
+
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+}
+
+// ----------------------------------------------------------------------------
+// PRODUCTS
+// ----------------------------------------------------------------------------
+// Physical and digital products that can be purchased.
+// Linked to entries (the media they contain) and characters (for merch).
+// ----------------------------------------------------------------------------
+
+// Purchasable items: figures, Blu-rays, vinyl, manga volumes, games, apparel.
+// One row per distinct SKU/product.
+//
+// Examples:
+//   'Marin Kitagawa 1/7 Scale Figure by Good Smile Company'
+//   'My Dress-Up Darling Blu-ray Box (Japan)'
+//   'Moving Pictures 180g Vinyl Reissue'
+Table products {
+  id uuid [pk]
+
+
+
+
+
+  // Product name/title. Descriptive enough to identify the specific product.
+  // Example: 'Marin Kitagawa 1/7 Scale Figure', 'My Dress-Up Darling Blu-ray Box'
+  name text [not null]
+
+  // Official release date. When the product becomes available.
+  // Example: '2024-06-15'
+  release_date date
+
+  // Date when pre-orders opened/will open. NULL if not applicable.
+  // Example: '2024-01-15'
+  preorder_date date
+
+  // Date/time when embargo lifts and product becomes visible.
+  // Used with visibility='embargoed'.
+  // Example: '2024-03-15T09:00:00Z'
+  embargo_datetime timestamptz
+
+  // Universal Product Code. 12-digit barcode number.
+  // Unique identifier for retail scanning and import matching.
+  // Example: '4580590121234'
+  upc varchar(20) [unique]
+
+  // Manufacturer's Suggested Retail Price.
+  // Example: 199.99
+  msrp decimal
+
+  // Currency for MSRP. ISO 4217 code.
+  // Example: 'USD', 'JPY', 'EUR'
+  currency varchar(3) [default: 'USD']
+
+  // Primary product category. FK to product_categories.id.
+  // Example: references 'figure' category
+  category_id uuid [not null, ref: > product_categories.id]
+
+  // More specific classification. FK to product_subcategories.id. NULL if none.
+  // Example: references 'scale_figure' under 'figure'
+  subcategory_id uuid [ref: > product_subcategories.id]
+
+  // Region/market for this product. FK to countries.code.
+  // Example: 'JP' for Japanese release, 'US' for US release
+  region varchar(2) [ref: > countries.code]
+
+  // Whether the product contains adult/NSFW content.
+  // Used for site-wide filtering.
+  nsfw boolean [default: false]
+
+  // URL or path to main product image.
+  primary_image text
+
+  // Visibility status for admin/embargo control.
+  // Values: 'public', 'hidden', 'embargoed', 'members_only'
+  // Example: 'embargoed' for pre-announcement products
+  visibility text [default: 'public']
+
+  // Whether product data has been verified by a moderator.
+  verified boolean [default: false]
+
+  // JSONB bucket for category-specific attributes.
+  // See jsonb_templates.md for per-category structure.
+  // Figure: height_mm, width_mm, material, scale, sculptor
+  // Home video: disc_count, runtime_minutes, region_code
+  // Book: page_count, isbn_13
+  details jsonb [default: '{}']
+
+  is_active boolean [default: true]
+
+  // URL-safe unique identifier. Used in URLs: /products/{slug}
+  // Example: 'marin-kitagawa-1-7-good-smile-company'
+  slug text [unique, not null]
+
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+}
+
+// Links companies to products with role context.
+// A product can have multiple companies in different roles.
+//
+// Examples:
+//   Good Smile Company -> 'Marin Figure' as manufacturer
+//   Aniplex -> 'Marin Figure' as licensor
+Table product_companies {
+  id uuid [pk]
+
+  // The product. FK to products.id.
+  product_id uuid [not null, ref: > products.id]
+
+  // The company. FK to companies.id.
+  company_id uuid [not null, ref: > companies.id]
+
+  // The role this company has. FK to company_roles.id.
+  // Example: references 'manufacturer' or 'licensor' role
+  role_id uuid [not null, ref: > company_roles.id]
+
+  // Display order among companies with the same role.
+  // 1 = primary, higher = secondary.
+  credit_order integer
+
+  // Additional context.
+  // Example: 'North American distribution only'
+  notes text
+
+  created_at timestamptz [default: `now()`]
+
+  indexes {
+    // One credit per company per role per product.
+    (product_id, company_id, role_id) [unique]
+  }
+}
+
+// Localized product names and descriptions.
+// Used when official product names differ by region/language.
+//
+// Example:
+//   Product: 'My Dress-Up Darling Complete Blu-ray Box'
+//   Translation (ja): 'その着せ替え人形は恋をする Blu-ray BOX'
+Table product_translations {
+  id uuid [pk]
+
+  // The product this translation belongs to.
+  product_id uuid [not null, ref: > products.id]
+
+  // The locale for this translation.
+  // Example: 'ja', 'en'
+  locale_code varchar(10) [not null, ref: > locales.code]
+
+  // Localized product name.
+  // Example: 'その着せ替え人形は恋をする Blu-ray BOX'
+  name text [not null]
+
+  // Localized product description.
+  description text
+
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+
+  indexes {
+    (product_id, locale_code) [unique]
+  }
+}
+
+// Additional images for products (beyond primary_image).
+// Used for gallery views, multiple angles, box art, etc.
+Table product_images {
+  id uuid [pk]
+
+  // The product this image belongs to.
+  product_id uuid [not null, ref: > products.id]
+
+  // Full URL or storage path to the image.
+  url text [not null]
+
+  // Alt text for accessibility.
+  // Example: 'Front view of Marin Kitagawa 1/7 scale figure'
+  alt text
+
+  // Sort order for gallery display. Lower numbers appear first.
+  // 0 = first, 1 = second, etc.
+  display_order integer [default: 0]
+
+  created_at timestamptz [default: `now()`]
+}
+
+// ----------------------------------------------------------------------------
+// RETAILERS & LISTINGS
+// ----------------------------------------------------------------------------
+// Retail storefronts and product availability/pricing.
+// Separate from companies because the relationship is commercial, not credit.
+// ----------------------------------------------------------------------------
+
+// Online retailers where products can be purchased.
+// Supports affiliate link generation and price tracking.
+//
+// Examples:
+//   'Amazon US', 'AmiAmi', 'Right Stuf', 'CDJapan', 'Good Smile Online Shop'
+Table retailers {
+  id uuid [pk]
+
+
+
+
+
+  // Display name.
+  // Example: 'Amazon US', 'AmiAmi', 'Right Stuf'
+  name text [not null]
+
+  // Main website URL.
+  // Example: 'https://www.amiami.com'
+  website text [not null]
+
+  // URL or path to retailer logo.
+  logo text
+
+  // Primary market/region. FK to countries.code.
+  // Example: 'JP' for AmiAmi, 'US' for Amazon US
+  region varchar(2) [ref: > countries.code]
+
+  // Default currency for this retailer.
+  // Example: 'JPY' for AmiAmi, 'USD' for Amazon US
+  currency varchar(3) [default: 'USD']
+
+  // Optional link to parent company if retailer is operated by a known company.
+  // Example: GSC Online Shop -> Good Smile Company
+  parent_company_id uuid [ref: > companies.id]
+
+  // JSONB for affiliate program details.
+  // Example: {"tag": "mysite-20", "network": "amazon_associates", "commission_rate": 0.04}
+  affiliate_info jsonb [default: '{}']
+
+  is_active boolean [default: true]
+
+  // URL-safe unique identifier.
+  // Example: 'amazon-us', 'amiami', 'rightstuf'
+  slug text [unique, not null]
+
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+}
+
+// Product availability and pricing at specific retailers.
+// Enables "where to buy" functionality and price tracking.
+//
+// Example:
+//   Product: 'Marin 1/7 Scale Figure'
+//   Retailer: 'AmiAmi'
+//   Price: 18,000 JPY
+//   Status: 'preorder'
+Table product_listings {
+  id uuid [pk]
+
+  // The product. FK to products.id.
+  product_id uuid [not null, ref: > products.id]
+
+  // The retailer. FK to retailers.id.
+  retailer_id uuid [not null, ref: > retailers.id]
+
+  // Direct URL to the product page at this retailer.
+  // Affiliate tags applied at display time using retailers.affiliate_info.
+  url text [not null]
+
+  // Retailer's internal SKU for this product.
+  // Useful for scraper matching and inventory sync.
+  sku text
+
+  // Current price at this retailer.
+  // Example: 18000 (for ¥18,000)
+  price decimal
+
+  // Currency for the price. Usually matches retailer default but can differ.
+  // Example: 'JPY', 'USD'
+  currency text
+
+  // Availability status.
+  // Values: 'unknown', 'in_stock', 'preorder', 'out_of_stock', 'backorder', 'discontinued'
+  status text [default: 'unknown']
+
+  // Timestamp of last scraper check.
+  // Used for staleness detection.
+  last_checked_at timestamptz
+
+  // Timestamp when price last changed.
+  // Useful for price history/alerts.
+  last_price_change_at timestamptz
+
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+
+  indexes {
+    // One listing per product per retailer.
+    (product_id, retailer_id) [unique]
+    // Common queries: "what's in stock?"
+    (status)
+    // Scraper scheduling: "what needs to be checked?"
+    (last_checked_at)
+  }
+}
+
+// ----------------------------------------------------------------------------
+// TV-SPECIFIC
+// ----------------------------------------------------------------------------
+// Seasons and episodes for TV series and anime.
+// Uses TVDB for normalization of anime's complex seasoning.
+// ----------------------------------------------------------------------------
+
+// Seasons within a TV series or anime entry.
+// Uses TVDB's normalized season numbering to handle Japanese cour chaos.
+//
+// Example:
+//   Entry: 'Demon Slayer: Kimetsu no Yaiba' (anime_series)
+//   Season 1: 'Tanjiro Kamado, Unwavering Resolve Arc'
+//   Season 2: 'Mugen Train Arc' + 'Entertainment District Arc'
+//   Season 3: 'Swordsmith Village Arc'
+Table entry_seasons {
+  id uuid [pk]
+
+  // The parent entry (TV series). FK to entries.id.
+  entry_id uuid [not null, ref: > entries.id]
+
+  // Season number. TVDB normalized, not Japanese broadcast numbering.
+  // Example: 1, 2, 3 (not "Part 2 Cour 1")
+  season_number integer [not null]
+
+  // Season title/name if applicable.
+  // Example: 'Swordsmith Village Arc', 'Final Season Part 3'
+  title text
+
+  // Alternative titles: Japanese name, romanized, etc.
+  // Example: ['刀鍛冶の里編', 'Katanakaji no Sato-hen']
+  alternate_titles text[]
+
+  // Number of episodes in this season.
+  episode_count integer
+
+  // First episode air date.
+  // Example: '2023-04-09'
+  air_date_start date
+
+  // Final episode air date.
+  // Example: '2023-06-18'
+  air_date_end date
+
+  // Season description/summary.
+  synopsis text
+
+  // Season poster/key art.
+  primary_image text
+
+  // TVDB season ID for syncing.
+  // Example: 1894073
+  tvdb_id integer
+
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+
+  indexes {
+    // One season number per entry.
+    (entry_id, season_number) [unique]
+    // TVDB sync lookups.
+    (tvdb_id)
+  }
+}
+
+// Individual episodes within a season.
+//
+// Example:
+//   Season: 'Demon Slayer S3: Swordsmith Village Arc'
+//   Episode 1: 'Someone's Dream'
+//   Episode 2: 'Yoriichi Type Zero'
+Table season_episodes {
+  id uuid [pk]
+
+  // The parent season. FK to entry_seasons.id.
+  season_id uuid [not null, ref: > entry_seasons.id]
+
+  // Episode number within this season. 1-indexed.
+  // Example: 1, 2, 3
+  episode_number integer [not null]
+
+  // Series-wide episode number for long-runners.
+  // Example: 1074 for One Piece
+  // NULL for series where absolute numbering isn't used.
+  absolute_number integer
+
+  // Episode title. English by default.
+  // Example: 'Someone's Dream', 'Yoriichi Type Zero'
+  title text
+
+  // Alternative titles: Japanese, romanized, etc.
+  // Example: ['誰かの夢', 'Dareka no Yume']
+  alternate_titles text[]
+
+  // Original air date.
+  // Example: '2023-04-09'
+  air_date date
+
+  // Episode runtime in minutes.
+  // Example: 24
+  runtime_minutes integer
+
+  // Episode description/summary.
+  synopsis text
+
+  // Episode still/thumbnail.
+  primary_image text
+
+  // TVDB episode ID for syncing.
+  // Example: 1894073
+  tvdb_id integer
+
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+
+  indexes {
+    // One episode number per season.
+    (season_id, episode_number) [unique]
+    // TVDB sync lookups.
+    (tvdb_id)
+  }
+}
+
+// ----------------------------------------------------------------------------
+// MUSIC-SPECIFIC
+// ----------------------------------------------------------------------------
+// Tracks and per-release track ordering.
+// Tracks exist as a pool; products define the ordering for each release.
+// ----------------------------------------------------------------------------
+
+// Individual songs/tracks that belong to a music album entry.
+// Stored as an unordered pool because different releases have different track lists.
+// Track ordering is defined per-product in product_tracks.
+//
+// Example:
+//   Entry: 'Moving Pictures' (album)
+//   Tracks: 'Tom Sawyer', 'Red Barchetta', 'YYZ', 'Limelight', ...
+Table music_tracks {
+  id uuid [pk]
+
+  // The album this track conceptually belongs to. FK to entries.id.
+  // Must reference an entry with media_type = 'music_album'.
+  entry_id uuid [not null, ref: > entries.id]
+
+  // Track title as it appears on the album.
+  // Example: 'Tom Sawyer', 'YYZ'
+  title text [not null]
+
+  // Alternative titles: romanizations, translations, alternate versions.
+  // Example: ['トム・ソーヤー'] for Japanese release
+  alternate_titles text[]
+
+  // Track length in seconds.
+  // Example: 276 for 4:36
+  duration_seconds integer
+
+  // Whether the track has no vocals.
+  // Example: TRUE for 'YYZ', FALSE for 'Tom Sawyer'
+  is_instrumental boolean [default: false]
+
+  // International Standard Recording Code. 12-character identifier.
+  // Example: 'USPR37900001'
+  isrc varchar(12)
+
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+}
+
+// Track ordering per product release.
+// Allows the same track to appear in different positions across releases.
+//
+// Examples:
+//   'Tom Sawyer' is track 1 on US vinyl
+//   'Tom Sawyer' is track 2 on Japan CD (after bonus intro)
+//   'Tom Sawyer' is track 5 on Greatest Hits compilation
+Table product_tracks {
+  id uuid [pk]
+
+  // The product (specific release). FK to products.id.
+  product_id uuid [not null, ref: > products.id]
+
+  // The track. FK to music_tracks.id.
+  track_id uuid [not null, ref: > music_tracks.id]
+
+  // Disc number for multi-disc releases.
+  // Example: 1 for disc one, 2 for disc two
+  disc_number integer [default: 1]
+
+  // Track position on this disc. 1-indexed.
+  // Example: 1 for first track, 5 for fifth
+  track_number integer [not null]
+
+  created_at timestamptz [default: `now()`]
+
+  indexes {
+    // Unique track position per disc per product.
+    (product_id, disc_number, track_number) [unique]
+    // Each track appears once per product.
+    (product_id, track_id) [unique]
+  }
+}
+
+// Per-track creator credits for featured artists, guest musicians, producers.
+// Album-level credits (main artist, primary producer) go in entry_creators.
+// Track-level credits are for exceptions and additions.
+//
+// Example:
+//   'Hugh Syme' as 'synth' on 'Tom Sawyer' (guest on one track)
+//   'Kendrick Lamar' as 'featured_artist' on a specific track
+Table track_creators {
+  id uuid [pk]
+
+  // The track. FK to music_tracks.id.
+  track_id uuid [not null, ref: > music_tracks.id]
+
+  // The creator. FK to creators.id.
+  creator_id uuid [not null, ref: > creators.id]
+
+  // The role on this track. FK to creator_roles.id.
+  role_id uuid [not null, ref: > creator_roles.id]
+
+  created_at timestamptz [default: `now()`]
+
+  indexes {
+    // One credit per creator per role per track.
+    (track_id, creator_id, role_id) [unique]
+  }
+}
+
+// ----------------------------------------------------------------------------
+// JUNCTION TABLES - ENTRIES
+// ----------------------------------------------------------------------------
+// Many-to-many relationships between entries and other entities.
+// Each junction table captures contextual metadata about the relationship.
+// ----------------------------------------------------------------------------
+
+// Links creators (people) to entries with role context.
+// A person can have multiple roles on the same entry (director + writer).
+// Special handling for voice actors: includes character and language.
+//
+// Examples:
+//   Quentin Tarantino -> 'Pulp Fiction' as director
+//   Quentin Tarantino -> 'Pulp Fiction' as screenwriter
+//   Hina Suguta -> 'My Dress-Up Darling' as voice_actor for Marin (Japanese)
+//   AmaLee -> 'My Dress-Up Darling' as voice_actor for Marin (English)
+Table entry_creators {
+  id uuid [pk]
+
+  // The entry. FK to entries.id.
+  entry_id uuid [not null, ref: > entries.id]
+
+  // The creator. FK to creators.id.
+  creator_id uuid [not null, ref: > creators.id]
+
+  // The role. FK to creator_roles.id.
+  role_id uuid [not null, ref: > creator_roles.id]
+
+  // For voice actors: the character they voice. FK to characters.id.
+  // NULL for non-voice roles.
+  character_id uuid [ref: > characters.id]
+
+  // For voice actors: which language dub. ISO 639-1 code.
+  // NULL for non-voice roles.
+  // Example: 'ja' for Japanese, 'en' for English
+  language varchar(10)
+
+  // Billing order for credits display. 1 = top billed.
+  credit_order integer
+
+  // Additional notes.
+  // Example: 'uncredited', 'voice only'
+  notes text
+
+  created_at timestamptz [default: `now()`]
+  updated_at timestamptz [default: `now()`]
+
+  indexes {
+    // Allows same VA to voice multiple characters, different VAs for different dubs.
+    (entry_id, creator_id, role_id, character_id, language) [unique]
+  }
+}
+
+// Links companies to entries with role context.
+// A company can have multiple roles (studio + distributor).
+//
+// Examples:
+//   CloverWorks -> 'My Dress-Up Darling' as studio
+//   Aniplex -> 'My Dress-Up Darling' as distributor
+Table entry_companies {
+  id uuid [pk]
+
+  // The entry. FK to entries.id.
+  entry_id uuid [not null, ref: > entries.id]
+
+  // The company. FK to companies.id.
+  company_id uuid [not null, ref: > companies.id]
+
+  // The role. FK to company_roles.id.
+  role_id uuid [not null, ref: > company_roles.id]
+
+  // Display order among companies with the same role.
+  credit_order integer
+
+  // Additional context.
+  // Example: 'co-production', 'North American distribution only'
+  notes text
+
+  created_at timestamptz [default: `now()`]
+
+  indexes {
+    // Same company can be both 'studio' and 'distributor' on same entry.
+    (entry_id, company_id, role_id) [unique]
+  }
+}
+
+// Links entries to intellectual properties (franchises).
+// An entry can belong to multiple Franchises.
+//
+// Examples:
+//   'My Dress-Up Darling' anime -> 'My Dress-Up Darling' Franchise
+//   'Guardians of the Galaxy' -> 'GotG' Franchise AND 'MCU' Franchise
+Table entry_franchises {
+  id uuid [pk]
+
+  // The entry. FK to entries.id.
+  entry_id uuid [not null, ref: > entries.id]
+
+  // The Franchise. FK to franchises.id.
+  franchise_id uuid [not null, ref: > franchises.id]
+
+  // Release order position within this Franchise.
+  // Used to sort entries chronologically within a franchise.
+  // Example: 1 for first MCU film, 22 for Avengers: Endgame
+  franchise_release_order integer
+
+  created_at timestamptz [default: `now()`]
+
+  indexes {
+    (entry_id, franchise_id) [unique]
+  }
+}
+
+// Links entries to genres (many-to-many).
+//
+// Examples:
+//   'My Dress-Up Darling' -> 'comedy' (primary), 'romance', 'slice_of_life'
+Table entry_genres {
+  id uuid [pk]
+
+  // The entry. FK to entries.id.
+  entry_id uuid [not null, ref: > entries.id]
+
+  // The genre. FK to genres.id.
+  genre_id uuid [not null, ref: > genres.id]
+
+  // Whether this is the primary genre.
+  // Used when only one genre can be shown.
+  is_primary boolean [default: false]
+
+  created_at timestamptz [default: `now()`]
+
+  indexes {
+    (entry_id, genre_id) [unique]
+  }
+}
+
+// Links entries to each other with typed relationships.
+//
+// Examples:
+//   'My Dress-Up Darling' anime -> manga as 'adaptation'
+//   'Godfather Part II' -> 'Godfather' as 'sequel'
+Table entry_relationships {
+  id uuid [pk]
+
+  // The "from" entry. FK to entries.id.
+  source_entry_id uuid [not null, ref: > entries.id]
+
+  // The "to" entry. FK to entries.id.
+  target_entry_id uuid [not null, ref: > entries.id]
+
+  // The type of relationship. FK to relationship_types.id.
+  relationship_type_id uuid [not null, ref: > relationship_types.id]
+
+  // Additional context.
+  // Example: 'Loosely adapted, significant plot changes'
+  notes text
+
+  created_at timestamptz [default: `now()`]
+
+  indexes {
+    // Unique per direction.
+    (source_entry_id, target_entry_id, relationship_type_id) [unique]
+  }
+}
+
+// Links entries to tags (many-to-many).
+//
+// Examples:
+//   'My Dress-Up Darling' -> 'cosplay', 'cozy', 'school'
+//   'Steins;Gate' -> 'time_travel', 'sci_fi', 'thriller'
+Table entry_tags {
+  id uuid [pk]
+
+  // The entry. FK to entries.id.
+  entry_id uuid [not null, ref: > entries.id]
+
+  // The tag. FK to tags.id.
+  tag_id uuid [not null, ref: > tags.id]
+
+  created_at timestamptz [default: `now()`]
+
+  indexes {
+    (entry_id, tag_id) [unique]
+  }
+}
+
+// Links characters to entries where they appear.
+//
+// Examples:
+//   'Marin Kitagawa' -> 'My Dress-Up Darling' anime as 'main'
+//   'Link' -> 'Super Smash Bros. Ultimate' as 'supporting'
+Table entry_characters {
+  id uuid [pk]
+
+  // The entry. FK to entries.id.
+  entry_id uuid [not null, ref: > entries.id]
+
+  // The character. FK to characters.id.
+  character_id uuid [not null, ref: > characters.id]
+
+  // Character's prominence.
+  // Values: 'main', 'supporting', 'minor', 'cameo', 'mentioned'
+  role text
+
+  created_at timestamptz [default: `now()`]
+
+  indexes {
+    (entry_id, character_id) [unique]
+  }
+}
+
+// ----------------------------------------------------------------------------
+// JUNCTION TABLES - PRODUCTS
+// ----------------------------------------------------------------------------
+// Many-to-many relationships between products and other entities.
+// ----------------------------------------------------------------------------
+
+// Links products to entries (the media content they contain).
+// Most products link to one entry, but box sets link to many.
+//
+// Examples:
+//   'My Dress-Up Darling Blu-ray Vol. 1' -> anime entry
+//   'MCU Phase One Box Set' -> Iron Man, Hulk, Iron Man 2, Thor, Cap, Avengers
+Table product_entries {
+  id uuid [pk]
+
+  // The product. FK to products.id.
+  product_id uuid [not null, ref: > products.id]
+
+  // The entry. FK to entries.id.
+  entry_id uuid [not null, ref: > entries.id]
+
+  // Order/position of this entry within the product.
+  // For box sets: disc number or sequence.
+  product_order integer
+
+  // Additional context.
+  // Example: 'Disc 1', 'Includes theatrical and extended cuts'
+  notes text
+
+  created_at timestamptz [default: `now()`]
+
+  indexes {
+    (product_id, entry_id) [unique]
+  }
+}
+
+// Links products to characters featured on them.
+// Critical for figure search: "all Marin Kitagawa figures".
+//
+// Examples:
+//   'Marin Kitagawa 1/7 Scale Figure' -> 'Marin Kitagawa'
+//   'My Dress-Up Darling Duo Figure' -> 'Marin Kitagawa', 'Wakana Gojo'
+Table product_characters {
+  id uuid [pk]
+
+  // The product. FK to products.id.
+  product_id uuid [not null, ref: > products.id]
+
+  // The character. FK to characters.id.
+  character_id uuid [not null, ref: > characters.id]
+
+  created_at timestamptz [default: `now()`]
+
+  indexes {
+    (product_id, character_id) [unique]
+  }
+}
