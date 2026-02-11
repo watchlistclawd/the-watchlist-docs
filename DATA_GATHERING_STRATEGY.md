@@ -29,6 +29,19 @@ Every entity should accumulate IDs as discovered:
 - `imdb_id` — future (movies/TV)
 - `igdb_id` — future (games)
 
+### ⚠️ AniList ID Namespacing
+
+**AniList IDs are NOT globally unique.** They are unique only within each entity type (Media, Character, Staff, Studio). ID 16498 is both "Shingeki no Kyojin" (Media) and "Takako Kimura" (Character).
+
+This is safe in our schema because IDs are stored on type-specific tables:
+- `entries.details.anilist_ids` → always AniList Media IDs
+- `characters.details.anilist_id` → always AniList Character IDs
+- `creators.details.anilist_id` → always AniList Staff IDs
+
+**The risk is `entries.details.anilist_ids`** — AniList treats anime and manga as separate Media entries with separate ID sequences, but they share the same `Media` type. A consolidated anime entry stores anime AniList IDs; a manga entry stores manga AniList IDs. If `media_type_id` is wrong on an entry, the AniList IDs become ambiguous. Always maintain accurate `media_type_id`.
+
+**Rule:** Never store bare AniList IDs in a context-free location (e.g. a flat cross-reference table) without also storing the entity type (media/character/staff/studio).
+
 ---
 
 ## Table-by-Table, Column-by-Column
