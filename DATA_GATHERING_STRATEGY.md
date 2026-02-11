@@ -134,11 +134,11 @@ The principle: **TVDB defines structure, AniList/MAL enrich it.** Never let AniL
 | `season_id` | FK → entry_seasons |
 | `episode_number` | **TVDB** episode number within season. Cross-check with AniList episode count. |
 | `absolute_number` | Calculate: sum of all previous seasons' episode counts + this episode's number. TVDB sometimes has this natively. |
-| `title` | **TVDB** `name` (English). This is TVDB's strength — per-episode titles. Fallback: **Fan wiki** (Fandom) episode lists. |
-| `alternate_titles` | **TVDB** episode name in Japanese (if available via translations endpoint). Fan wiki for romanized titles. |
+| `title` | **TVDB** `/episodes/{id}/translations/eng` → English title. Fallback: TVDB `name` field (series primary language). Always prefer English for display. |
+| `alternate_titles` | TVDB `name` field (native/original language title, e.g. Japanese) goes here when English title is available and differs. Additional languages from TVDB translations endpoint if needed. |
 | `air_date` | **TVDB** `aired` date. This is authoritative for episode-level air dates. Cross-check AniList `airingSchedule` if available. |
 | `runtime_minutes` | **TVDB** `runtime`. Fallback: **AniList** `duration` (per-episode average for the season). |
-| `synopsis` | **TVDB** episode overview. Fallback: **Fan wiki** (Fandom) episode pages. |
+| `synopsis` | **TVDB** `/episodes/{id}/translations/eng` → English overview. Fallback: TVDB `overview` field. Leave NULL if no English synopsis available. |
 | `primary_image` | **TVDB** episode image (`image` field). This is TVDB's killer feature — per-episode stills. |
 | `tvdb_id` | **TVDB** episode ID. Dedicated column. |
 | `created_at` / `updated_at` | Auto |
