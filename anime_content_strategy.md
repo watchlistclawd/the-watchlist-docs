@@ -43,6 +43,32 @@ Wikipedia: Polite              → sleep 1s between calls
 Brave:     1 request/10s       → sleep 10s between searches
 ```
 
+### AniList Pagination
+
+AniList paginates all connection fields (characters, staff, relations). **Default perPage is 25.**
+
+**Always check pageInfo first:**
+```graphql
+characters { pageInfo { total lastPage perPage } }
+```
+
+**Pagination pattern:**
+```graphql
+characters(page: $page, perPage: 25, sort: FAVOURITES_DESC) {
+  pageInfo { hasNextPage currentPage }
+  edges { ... }
+}
+```
+
+**Strategy for large franchises:**
+- Check `pageInfo.total` first to understand scope
+- For characters: Top 50-100 by favorites covers all significant characters
+- For staff: Usually 1-2 pages is sufficient
+- Loop with `page: N` until `hasNextPage: false` or target count reached
+- Respect rate limits: 0.7s between paginated calls
+
+> ⚠️ **Common mistake:** Assuming one query gets everything. AoT has 500 characters across 20 pages. Always paginate or set explicit limits.
+
 ---
 
 ## API Endpoints Reference
@@ -65,11 +91,38 @@ query Media($id: Int, $search: String, $type: MediaType) {
     genres tags { name rank category isMediaSpoiler }
     studios { nodes { id name isAnimationStudio } edges { isMain } }
     staff { nodes { id name { full native } } edges { role } }
-    characters { nodes { id name { full native } } edges { role voiceActors { id name { full native } languageV2 } } }
+    characters { 
+      edges { 
+        role 
+        node { id name { full native } } 
+        voiceActors(language: JAPANESE) { id name { full native } languageV2 } 
+      } 
+    }
     relations { edges { relationType node { id type format title { romaji } } } }
     countryOfOrigin isAdult
   }
 }
+```
+
+> ⚠️ **CRITICAL: AniList Character/VA Query Gotcha**
+> 
+> Voice actors live on the **character edge**, NOT the character node. You MUST query through `characters.edges` to get VAs:
+> - `characters.edges[].node` → the character data
+> - `characters.edges[].voiceActors` → the VAs for that character in that media
+> - `characters.edges[].role` → MAIN, SUPPORTING, or BACKGROUND
+> 
+> If you query `characters.nodes` only, you'll get characters but NO voice actor data.
+> 
+> **Correct pattern:**
+> ```graphql
+> characters {
+>   edges {
+>     role
+>     node { id name { full native } description image { large } }
+>     voiceActors(language: JAPANESE) { id name { full native } languageV2 }
+>   }
+> }
+> ```
 
 # Staff (creator) query
 query Staff($id: Int) {
@@ -169,9 +222,37 @@ SELECT ?birth ?death ?nationality ?image WHERE {
 
 ### Character AniList ↔ MAL Matching
 
-1. Cross-reference via character appearances in matched entries
-2. Match by name (romaji) + franchise context
-3. If ambiguous, prefer AniList as canonical source
+**Data sources:**
+- AniList: `Media.characters.edges[]` (includes role, node, voiceActors)
+- Jikan bulk: `/anime/{mal_id}/characters` (MAL IDs + VAs, but NO `name_kanji`)
+- Jikan individual: `/characters/{mal_id}` (includes `name_kanji` for native matching)
+
+> ⚠️ **API tradeoff:** Native name matching is most reliable but requires individual character fetches from Jikan (the bulk endpoint omits `name_kanji`). For ~50 characters, budget ~20 seconds of API calls.
+
+**Matching algorithm (name-based only, never use ID matching):**
+1. **Native name match:** Compare kanji/kana names directly (AniList `name.native` ↔ Jikan `name_kanji`)
+2. **Normalize romanized:** lowercase, remove accents (ö→o, ë→e), strip punctuation
+3. **Exact match:** normalized AniList name = normalized MAL name
+4. **Reversed match:** MAL uses "Family, Given" format → try "Given Family"
+5. **Fuzzy match:** SequenceMatcher ratio > 0.6 threshold
+
+**Example mappings:**
+- "Mikasa no Haha" ↔ "Mother Ackerman" → both have native `ミカサの母` (native match)
+- "Hange Zoe" ↔ "Zoë, Hange" (accent normalization + reversal)
+- "Moblit Berner" ↔ "Berner, Moblit" (reversal)
+
+**Expected coverage:** ~94% for typical franchises. Missing characters are usually:
+- Named Titans/creatures (AniList-only)
+- Very minor characters with drastically different naming
+
+### Voice Actor AniList ↔ MAL Matching
+
+**Workflow:**
+1. Get VAs from AniList via `characters.edges[].voiceActors(language: JAPANESE)`
+2. Get VAs from Jikan via `/anime/{id}/characters` → `voice_actors` array
+3. Match character first (using above algorithm), then inherit VA MAL ID from Jikan data
+
+**Key insight:** Once you match a character between AniList↔MAL, the VA MAL ID comes "for free" from the Jikan character data. Don't try to match VAs independently — match via characters.
 
 ### Creator AniList ↔ MAL Matching
 
@@ -206,7 +287,6 @@ When data cannot be found after reasonable research effort:
 | `franchise_release_order` | `1` | Default ordering |
 | `tvdb_id` | `0` | Indicates not matched |
 | `alternate_names` | `'{}'::text[]` | Empty array |
-| `is_primary` (genres) | `false` | Conservative default |
 | `role` (characters) | `'supporting'` | Conservative default |
 
 ---
@@ -315,6 +395,12 @@ When data cannot be found after reasonable research effort:
 | `details` | jsonb | `{"anilist_id": N, "mal_id": N, "age": "17", "gender": "Female", "blood_type": "O"}` |
 
 **Deduplication:** Characters have global AniList IDs. Consolidate across entries by anilist_id.
+
+> ⚠️ **AniList and MAL IDs are COMPLETELY DIFFERENT.** 
+> - AniList ported MAL data at launch but IDs have since diverged
+> - **Never use ID matching** — any apparent matches are coincidental
+> - **Always cross-reference via name matching:** normalized name → reversed name → fuzzy match
+> - Store both `anilist_id` and `mal_id` separately in details JSONB
 
 ---
 
@@ -432,7 +518,6 @@ When data cannot be found after reasonable research effort:
 | `id` | uuid | Auto |
 | `entry_id` | uuid NOT NULL | FK → entries |
 | `genre_id` | uuid NOT NULL | FK → genres. **AniList** genres[] mapped to our genre table. |
-| `is_primary` | boolean | First 3 AniList genres → `true`. Rest → `false`. |
 
 ---
 

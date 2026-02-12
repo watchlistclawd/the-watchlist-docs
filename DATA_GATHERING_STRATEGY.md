@@ -181,7 +181,6 @@ The principle: **TVDB defines structure, AniList/MAL enrich it.** Never let AniL
 | `id` | Auto-generated UUID |
 | `entry_id` | FK → entries |
 | `genre_id` | FK → genres. **AniList** `genres[]` mapped to our genre table. **MAL** genres as cross-check. AniList genres are cleaner (fewer duplicates). |
-| `is_primary` | First 3 genres listed by AniList → `true`. Rest → `false`. Heuristic: AniList lists genres in relevance order. |
 | `created_at` | Auto |
 
 **Genre mapping**: AniList genres map 1:1 to our seed data (Action, Adventure, Comedy, Drama, etc.). Any new genres discovered → create in `genres` table. MAL sometimes has more specific genres — merge if they match our taxonomy.

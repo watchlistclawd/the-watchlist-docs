@@ -128,7 +128,7 @@ English name/title/description lives on the **main entity table**. Other locales
 | `entry_creators` | Entry ↔ Creator with role, optional character_id + language (for voice actors), credit order |
 | `entry_companies` | Entry ↔ Company with role, credit order, notes |
 | `entry_franchises` | Entry ↔ Franchise with franchise release order |
-| `entry_genres` | Entry ↔ Genre with is_primary flag |
+| `entry_genres` | Entry ↔ Genre link |
 | `entry_relationships` | Directed entry-to-entry relationships with type and notes |
 | `entry_tags` | Entry ↔ Tag join table |
 | `entry_characters` | Character appearances in entries with role (main, supporting, etc.) |
