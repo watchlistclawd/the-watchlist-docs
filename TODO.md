@@ -5,11 +5,18 @@
 
 ---
 
-## Current State (2026-02-11)
+## Current State (2026-02-12)
 
 **Pipeline v4 is functional.** 18 scripts + 4 common modules running end-to-end.
 AoT loaded: 1 franchise, 22 entries, 4 seasons, 89 episodes, 207 characters, 473 creators, 15 companies.
 14 validation views in PostgreSQL. English episode titles/synopses via TVDB translations.
+
+**Recent improvements (2026-02-11):**
+- Creator MAL matching: 414/473 (87.5%) — up from 408 via VA cross-ref + name variants
+- Character MAL matching: 165/207 (79.7%) — up from 111 via VA cross-ref
+- Wikidata 5-tier cascade: 309/473 (65.3%) creators matched with confidence flags
+  - 200 high confidence (birthdate-verified), 109 low (occupation-only)
+- `wikidata_confidence` column added to creators table + v_creators view
 
 **Repos:**
 - `watchlistclawd/the-watchlist-pipeline` — v4 pipeline (private)
@@ -21,57 +28,96 @@ AoT loaded: 1 franchise, 22 entries, 4 seasons, 89 episodes, 207 characters, 473
 
 ## Active TODO
 
-### 1. Improve Creator Matching + Alternate Names
+### 1. Compartmentalized Data Gathering (Source Cache) — HIGH PRIORITY
 
-**Problem:** Only 141/473 creators have MAL IDs (30%). Current matching is exact-name-only. AniList `name.alternative` and MAL `alternate_names` are ignored entirely.
+**Problem:** Every franchise re-fetches all its creators/characters from AniList individually. Shared entities (VAs in multiple franchises) get re-pulled. 473 individual AniList calls with rate limiting = 15+ minutes per run.
+
+**Solution:** Global entity cache with per-source manifests.
+
+```
+cache/sources/
+  anilist/
+    staff/{id}.json        ← one file per person
+    characters/{id}.json
+    media/{id}.json
+    manifest.json          ← pull dates, staleness tracking
+  mal/
+    people/{id}.json
+    characters/{id}.json
+    anime/{id}.json
+    manifest.json
+  tvdb/
+    series/{id}.json
+    episodes/{id}.json
+    manifest.json
+  wikidata/
+    entities/{qid}.json
+    manifest.json
+```
+
+**How it works:**
+1. Franchise discovery returns entity IDs (staff, chars, media)
+2. Check cache manifest — skip if fresh, fetch if missing/stale
+3. Processing reads from global cache, not franchise-specific sources
+4. Second franchise onwards is near-instant for shared entities
+
+**Staleness rules:**
+| Entity Type | Stale After | Rationale |
+|-------------|------------|-----------|
+| Staff/People | 90 days | Names/bios rarely change |
+| Characters | 90 days | Static once created |
+| Media/Entries | 30 days | New seasons, status changes |
+| Episodes | 7 days | Airing shows need fresh data |
+| Companies | 180 days | Very static |
+
+**Implementation steps:**
+- [ ] Build `common/source_cache.py` — cache read/write/staleness logic
+- [ ] Refactor AniList fetching to use cache
+- [ ] Refactor MAL fetching to use cache
+- [ ] Refactor TVDB fetching to use cache
+- [ ] Update `12_create_creators.py` — alt name fetch reads from cache
+- [ ] Backfill cache from existing `sources/attack-on-titan/` data
+- [ ] Add `cache_stats.py` — show coverage, stale counts
+
+### 2. Improve Creator Matching + Alternate Names
+
+**Status:** Mostly done. Character cross-ref + name variants implemented.
 
 **Schema change:**
-- [ ] `ALTER TABLE creators ADD COLUMN alternate_names text[];`
-
-**Data sources for alternate names:**
-
-| Source | Field | Example |
-|--------|-------|---------|
-| AniList Staff | `name.alternative[]` | "Alexander Moran" for Alex Organ |
-| Jikan/MAL Person | `alternate_names[]` | Same + additional variants |
-| Jikan/MAL Person | `given_name` + `family_name` | Japanese name components |
-| Wikidata | `skos:altLabel` | Sparse for VAs, better for directors |
+- [x] `ALTER TABLE creators ADD COLUMN alternate_names text[];`
 
 **Pipeline changes:**
-- [ ] `01_fetch_anilist.py` — ensure `name.alternative` is captured on staff data
-- [ ] `02_fetch_mal.py` — fetch character-VA data per entry for cross-matching
-- [ ] `12_create_creators.py` — rewrite MAL matching:
-  1. **Character-VA pairing** (primary) — if AniList VA X voices Character Y, and MAL VA Z voices the same character, then X=Z. Way more reliable than name matching.
-  2. **Alt name cross-reference** — if AniList `alternative[]` contains MAL name or vice versa, match
-  3. **Fuzzy name matching** (fallback) — use rapidfuzz from `common/matching.py`
-  4. **Store `alternate_names[]`** — union of AniList + MAL alt names, deduplicated
-- [ ] `common/api_clients.py` — verify `jikan_person_full()` exists or add it
-- [ ] Jikan person enrichment — for matched creators, fetch `/people/{mal_id}/full` to get `alternate_names[]`, `given_name`, `family_name`, `about`
+- [x] `12_create_creators.py` — character-VA cross-reference matching (primary strategy)
+- [x] `12_create_creators.py` — name variant matching (native_name, alt_names against MAL index)
+- [x] `12_create_creators.py` — fuzzy name matching checks all name variants
+- [x] `10_create_characters.py` — VA cross-reference fallback for character MAL matching
+- [x] `10_create_characters.py` — match by all name variants (full, native, alternates)
+- [ ] `01_fetch_anilist.py` — ensure `name.alternative` captured on staff (currently fetched in 12, should move to source cache)
 
-**Target:** >90% MAL coverage (up from 30%)
+**Results:**
+- Creator MAL match: 414/473 (87.5%) — target was >90%, close
+- Character MAL match: 165/207 (79.7%) — up from 111
+- Remaining misses are mostly translation gaps (e.g. "Moses no Haha" vs "Moses's Mother")
 
-**Verification:**
-- [ ] Re-run creator pipeline for AoT
-- [ ] Verify Alex Organ has MAL ID + alternate names
-- [ ] Check MAL match rate improvement
-- [ ] Spot-check 10 random creators for data quality
+### 3. Harden Enrichment (Script 18)
 
-### 2. Harden Enrichment (Script 18)
+**Status:** Wikidata cascade implemented and validated.
 
-**Problem:** Wikidata enrichment is the weakest link. Many creators missing birth dates, companies have 0/15 images.
-
-- [ ] Improve SPARQL queries — try name+occupation matching, not just AniList/MAL ID lookup
+- [x] 5-tier Wikidata cascade for creators (MAL ID → native name+birth → native name+occupation → English+birth → English+occupation)
+- [x] Birth date validation ±30 days (caught 41 false positives)
+- [x] `wikidata_confidence` flag (high/low) in JSON + DB
+- [x] `wikidata_confidence` column in v_creators view
 - [ ] Wikipedia infobox parsing for birth dates, founding years, HQ countries
-- [ ] Company image sourcing (Wikipedia/Commons logos)
+- [ ] Company image sourcing (Wikipedia/Commons logos) — 0/15 companies have images
 - [ ] Image URL validation (HEAD requests to verify live URLs)
 
-### 3. Pipeline Infrastructure
+### 4. Pipeline Infrastructure
 
 - [ ] `run_all.py` orchestrator — run scripts 00-18 in order for a given franchise
-- [ ] Bake TVDB English translation fetch into `06_create_episodes.py` ✅ (done)
-- [ ] Update `06_create_episodes.py` SQL to include `alternate_titles` in ON CONFLICT ✅ (done)
+- [x] Bake TVDB English translation fetch into `06_create_episodes.py`
+- [x] Update `06_create_episodes.py` SQL to include `alternate_titles` in ON CONFLICT
 
-### 4. Test on More Franchises
+### 5. Test on More Franchises
 
 - [ ] JoJo's Bizarre Adventure
 - [ ] Sentenced to Be a Hero
